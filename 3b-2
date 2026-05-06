@@ -1,0 +1,69 @@
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = models.resnet50(pretrained=True)
+model.eval()
+model = model.to(device)
+
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+img_path = "lion.jpg"
+image = Image.open(img_path).convert('RGB')
+
+input_tensor = transform(image).unsqueeze(0).to(device)
+with torch.no_grad():
+    output = model(input_tensor)
+    probs = torch.nn.functional.softmax(output, dim=1)
+
+top_prob, top_class = probs.topk(1)
+target_class = top_class.item()
+
+print("预测类别ID:", target_class)
+print("概率:", top_prob.item())
+def occlusion_sensitivity(model, image, target_class,
+                          occ_size=64, stride=8):
+    
+    _, _, H, W = image.shape
+    
+    heatmap = np.zeros((H, W))
+    
+    for y in range(-occ_size + stride, H, stride):
+        for x in range(-occ_size + stride, W, stride):
+            
+            occluded = image.clone()
+            
+            y1 = max(y, 0)
+            y2 = min(y + occ_size, H)
+            x1 = max(x, 0)
+            x2 = min(x + occ_size, W)
+            
+            occluded[:, :, y1:y2, x1:x2] = 0  # 灰色块
+            
+            with torch.no_grad():
+                output = model(occluded)
+                prob = torch.nn.functional.softmax(output, dim=1)[0, target_class].item()
+            
+            heatmap[y1:y2, x1:x2] += prob
+    
+    heatmap = heatmap / heatmap.max()
+    
+    return heatmap
+    heatmap = occlusion_sensitivity(
+    model,
+    input_tensor,
+    target_class,
+    occ_size=64,
+    stride=8
+)
