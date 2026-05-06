@@ -1,0 +1,205 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+from PIL import Image
+import os
+import matplotlib.pyplot as plt
+import torch
+torch.backends.cudnn.enabled = False
+
+device = torch.device("cpu")
+print(device)
+
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+import random
+
+class FoodPix2PixDataset(Dataset):
+    def __init__(self, root):
+        self.root = root
+        self.classes = os.listdir(root)[:200]
+
+        self.class_to_images = {}
+
+        for c in self.classes:
+            c_path = os.path.join(root, c)
+            imgs = [
+                os.path.join(c_path, f)
+                for f in os.listdir(c_path)
+                if f.lower().endswith(('.jpg', '.png', '.jpeg'))
+            ]
+            if len(imgs) > 0:
+                self.class_to_images[c] = imgs
+
+        self.class_list = list(self.class_to_images.keys())
+
+        self.pairs = []
+        for c in self.class_list:
+            for img in self.class_to_images[c]:
+                self.pairs.append((c, img))
+
+        print("total images:", len(self.pairs))
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        c1, path1 = self.pairs[idx]
+
+       
+        path2 = random.choice(self.class_to_images[c1])
+
+        img1 = Image.open(path1).convert("RGB")
+        img2 = Image.open(path2).convert("RGB")
+
+        x = transform(img1)
+        y = transform(img2)
+
+        return x, y
+
+        dataset = FoodPix2PixDataset("/export/space0/yanai/media/foodimg128/")
+        loader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+class UNetBlock(nn.Module):
+    def __init__(self, in_c, out_c, down=True, use_bn=True, dropout=False):
+        super().__init__()
+
+        if down:
+            self.block = nn.Sequential(
+                nn.Conv2d(in_c, out_c, 4, 2, 1),
+                nn.BatchNorm2d(out_c) if use_bn else nn.Identity(),
+                nn.LeakyReLU(0.2)
+            )
+        else:
+            self.block = nn.Sequential(
+                nn.ConvTranspose2d(in_c, out_c, 4, 2, 1),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU()
+            )
+
+        self.dropout = nn.Dropout(0.5) if dropout else nn.Identity()
+
+    def forward(self, x):
+        return self.dropout(self.block(x))
+
+
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.down1 = UNetBlock(3, 64, down=True, use_bn=False)
+        self.down2 = UNetBlock(64, 128)
+        self.down3 = UNetBlock(128, 256)
+        self.down4 = UNetBlock(256, 512)
+        self.down5 = UNetBlock(512, 512)
+
+        self.up1 = UNetBlock(512, 512, down=False, dropout=True)
+        self.up2 = UNetBlock(1024, 256, down=False)
+        self.up3 = UNetBlock(512, 128, down=False)
+        self.up4 = UNetBlock(256, 64, down=False)
+
+        self.final = nn.ConvTranspose2d(128, 3, 4, 2, 1)
+
+    def forward(self, x):
+
+        d1 = self.down1(x)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
+        d5 = self.down5(d4)
+
+        u1 = self.up1(d5)
+        u2 = self.up2(torch.cat([u1, d4], 1))
+        u3 = self.up3(torch.cat([u2, d3], 1))
+        u4 = self.up4(torch.cat([u3, d2], 1))
+
+        out = self.final(torch.cat([u4, d1], 1))
+
+        return torch.tanh(out)
+        class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        def block(in_c, out_c, stride):
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, 4, stride, 1),
+                nn.BatchNorm2d(out_c),
+                nn.LeakyReLU(0.2)
+            )
+
+        self.model = nn.Sequential(
+            block(6, 64, 2),
+            block(64, 128, 2),
+            block(128, 256, 2),
+            nn.Conv2d(256, 1, 4, 1, 1)
+        )
+
+    def forward(self, x, y):
+        return self.model(torch.cat([x, y], 1))
+        G = Generator().to(device)
+D = Discriminator().to(device)
+
+opt_G = optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+opt_D = optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+
+criterion = nn.BCEWithLogitsLoss()
+L1 = nn.L1Loss()
+for epoch in range(2):
+    for i, (x, y) in enumerate(loader):
+        if i >= 200:
+            break
+        x, y = x.to(device), y.to(device)
+
+        # ------------------
+        # Train Discriminator
+        # ------------------
+        fake_y = G(x)
+
+        real = D(x, y)
+        fake = D(x, fake_y.detach())
+
+        loss_D = (criterion(real, torch.ones_like(real)) +
+                  criterion(fake, torch.zeros_like(fake))) * 0.5
+
+        opt_D.zero_grad()
+        loss_D.backward()
+        opt_D.step()
+
+        # ------------------
+        # Train Generator
+        # ------------------
+        fake = D(x, fake_y)
+
+        loss_G_GAN = criterion(fake, torch.ones_like(fake))
+        loss_G_L1 = L1(fake_y, y) * 100
+
+        loss_G = loss_G_GAN + loss_G_L1
+
+        opt_G.zero_grad()
+        loss_G.backward()
+        opt_G.step()
+
+        if i % 10 == 0:
+            print(f"Epoch {epoch}, Step {i}, D: {loss_D.item()}, G: {loss_G.item()}")
+
+            def show(img):
+    img = img.detach().cpu().permute(1,2,0)
+    img = (img + 1) / 2
+    plt.imshow(img)
+    plt.axis("off")
+    plt.show()
+
+x, y = next(iter(loader))
+x = x.to(device)
+
+with torch.no_grad():
+    fake = G(x)
+
+show(fake[0])
