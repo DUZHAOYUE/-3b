@@ -1,0 +1,145 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from PIL import Image
+import matplotlib.pyplot as plt
+import torchvision.transforms as transforms
+import torchvision.models as models
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_image(path, size=256):
+    image = Image.open(path).convert('RGB')
+
+    transform = transforms.Compose([
+            transforms.Resize((size, size)), 
+            transforms.ToTensor()
+    ])
+
+    image = transform(image).unsqueeze(0)
+    return image.to(device)
+
+content = load_image("dog.jpg",256)
+style = load_image("cat.jpg",256)
+
+
+def imshow(tensor, title=None):
+    image = tensor.clone().detach().cpu().squeeze(0)
+    image = transforms.ToPILImage()(image)
+
+    plt.imshow(image)
+    if title:
+        plt.title(title)
+    plt.axis("off")
+    plt.show()
+
+imshow(content, "Content")
+imshow(style, "Style")
+
+vgg = models.vgg19(pretrained=True).features.to(device).eval()
+class ContentLoss(nn.Module):
+    def __init__(self, target):
+        super().__init__()
+        self.target = target.detach()
+
+    def forward(self, input):
+        self.loss = torch.mean((input - self.target) ** 2)
+        return input
+
+        def gram_matrix(input):
+    b, c, h, w = input.size()
+    features = input.view(c, h * w)
+    G = torch.mm(features, features.t())
+    return G / (c * h * w)
+
+class StyleLoss(nn.Module):
+    def __init__(self, target_feature):
+        super().__init__()
+        self.target = gram_matrix(target_feature).detach()
+
+    def forward(self, input):
+        G = gram_matrix(input)
+        self.loss = torch.mean((G - self.target) ** 2)
+        return input
+
+        content_layers = ['conv_4']
+style_layers = ['conv_1','conv_2','conv_3','conv_4','conv_5']
+
+def get_model_and_losses(vgg, content_img, style_img):
+    model = nn.Sequential().to(device)
+
+    content_losses = []
+    style_losses = []
+
+    i = 0
+    for layer in vgg.children():
+        if isinstance(layer, nn.Conv2d):
+            i += 1
+            name = f'conv_{i}'
+        elif isinstance(layer, nn.ReLU):
+            name = f'relu_{i}'
+            layer = nn.ReLU(inplace=False)
+        elif isinstance(layer, nn.MaxPool2d):
+            name = f'pool_{i}'
+        else:
+            continue
+
+        model.add_module(name, layer)
+
+        if name in content_layers:
+            target = model(content_img).detach()
+            content_loss = ContentLoss(target)
+            model.add_module(f"content_loss_{i}", content_loss)
+            content_losses.append(content_loss)
+
+        if name in style_layers:
+            target = model(style_img).detach()
+            style_loss = StyleLoss(target)
+            model.add_module(f"style_loss_{i}", style_loss)
+            style_losses.append(style_loss)
+
+    return model, style_losses, content_losses
+
+    input_img = content.clone()
+
+    model, style_losses, content_losses = get_model_and_losses(vgg, content, style)
+
+optimizer = optim.LBFGS([input_img.requires_grad_()])
+
+num_steps = 300
+style_weight = 1000000
+content_weight = 1
+
+run = [0]
+while run[0] <= num_steps:
+
+    def closure():
+        input_img.data.clamp_(0, 1)
+
+        optimizer.zero_grad()
+        model(input_img)
+
+        style_score = 0
+        content_score = 0
+
+        for sl in style_losses:
+            style_score += sl.loss
+        for cl in content_losses:
+            content_score += cl.loss
+
+        loss = style_weight * style_score + content_weight * content_score
+        loss.backward()
+
+        run[0] += 1
+        if run[0] % 50 == 0:
+            print(f"Step {run[0]}:")
+            print("Style Loss:", style_score.item())
+            print("Content Loss:", content_score.item())
+
+        return loss
+
+    optimizer.step(closure)
+
+    input_img.data.clamp_(0, 1)
+imshow(input_img, "Output Image")
