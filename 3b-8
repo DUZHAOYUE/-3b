@@ -1,0 +1,181 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
+
+from PIL import Image
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+
+transform = transforms.Compose([
+    transforms.Resize(128),
+    transforms.CenterCrop(256),
+    transforms.ToTensor()
+])
+
+import os
+from torch.utils.data import Dataset
+
+class COCODataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        self.files = os.listdir(root)[:1000]
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root, self.files[idx])
+        image = Image.open(img_path).convert("RGB")
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image,0
+
+dataset = COCODataset(
+    "/export/data/dataset/COCO/train2014",
+    transform=transform
+)
+
+loader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+
+def load_image(path):
+    image = Image.open(path).convert("RGB")
+    image = transform(image).unsqueeze(0)
+    return image.to(device)
+
+style_img = load_image("dog.jpg")
+
+def gram(x):
+    b, c, h, w = x.size()
+    x = x.view(b, c, h * w)
+    x = x[0]
+    G = torch.mm(x, x.t())
+    return G / (c * h * w)
+
+vgg = models.vgg16(pretrained=True).features.to(device).eval()
+
+for param in vgg.parameters():
+    param.requires_grad = False
+
+def get_features(x, model):
+    features = {}
+    layers = {
+        '0': 'conv1',
+        '5': 'conv2',
+        '10': 'conv3',
+        '17': 'conv4',
+        '24': 'conv5'
+    }
+
+    for name, layer in model._modules.items():
+        x = layer(x)
+        if name in layers:
+            features[layers[name]] = x
+
+    return features
+
+style_features = get_features(style_img, vgg)
+style_grams = {layer: gram(style_features[layer]) for layer in style_features}
+
+class ConvLayer(nn.Module):
+    def __init__(self, in_c, out_c, k, s):
+        super().__init__()
+        self.conv = nn.Conv2d(in_c, out_c, k, s, padding=k//2)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = ConvLayer(channels, channels, 3, 1)
+        self.conv2 = ConvLayer(channels, channels, 3, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return x + self.conv2(self.relu(self.conv1(x)))
+
+class TransformNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            ConvLayer(3, 32, 9, 1),
+            nn.ReLU(),
+            ConvLayer(32, 64, 3, 2),
+            nn.ReLU(),
+            ConvLayer(64, 128, 3, 2),
+            nn.ReLU(),
+
+            ResidualBlock(128),
+            ResidualBlock(128),
+            ResidualBlock(128),
+            ResidualBlock(128),
+            ResidualBlock(128),
+
+            nn.Upsample(scale_factor=2),
+            ConvLayer(128, 64, 3, 1),
+            nn.ReLU(),
+
+            nn.Upsample(scale_factor=2),
+            ConvLayer(64, 32, 3, 1),
+            nn.ReLU(),
+
+            ConvLayer(32, 3, 9, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+model = TransformNet().to(device)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+content_weight = 1
+style_weight = 1e5
+
+for epoch in range(2):
+    for i, (x, _) in enumerate(loader):
+        x = x.to(device)
+
+        y = model(x)
+
+        y_features = get_features(y, vgg)
+        x_features = get_features(x, vgg)
+
+        # Content Loss
+        content_loss = torch.mean((y_features['conv4'] - x_features['conv4'])**2)
+
+        # Style Loss
+        style_loss = 0
+        for layer in style_grams:
+            G_y = gram(y_features[layer])
+            G_s = style_grams[layer]
+            style_loss += torch.mean((G_y - G_s)**2)
+
+        loss = content_weight * content_loss + style_weight * style_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if i % 50 == 0:
+            print(f"Epoch {epoch}, Step {i}, Loss {loss.item()}")
+def imshow(tensor):
+    image = tensor.clone().detach().cpu().squeeze(0)
+    image = transforms.ToPILImage()(image)
+    plt.imshow(image)
+    plt.axis("off")
+    plt.show()
+
+content_test = load_image("dog.jpg")
+
+with torch.no_grad():
+    output = model(content_test)
+
+imshow(output)
