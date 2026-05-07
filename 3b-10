@@ -1,0 +1,210 @@
+import tensorflow as tf
+import numpy as np
+import os
+import time
+import matplotlib.pyplot as plt
+
+BUFFER_SIZE = 1000
+BATCH_SIZE = 2
+IMG_WIDTH = 128
+IMG_HEIGHT = 128
+LAMBDA = 5
+
+AUTOTUNE = tf.data.experimental.AUTOTUNE
+
+def load_image(image_file):
+    image = tf.io.read_file(image_file)
+    image = tf.image.decode_jpeg(image)
+
+    image = tf.image.resize(image, [128, 128])
+
+    image = (tf.cast(image, tf.float32) / 127.5) - 1
+    return image
+
+def load_dataset(path):
+    data = tf.data.Dataset.list_files(path + '/*.jpg')
+    data = data.map(load_image, num_parallel_calls=AUTOTUNE)
+    data = data.shuffle(BUFFER_SIZE)
+    data = data.batch(BATCH_SIZE)
+    return data
+
+A_path = "./animal/dog"
+B_path = "./animal/cat"
+
+trainA = load_dataset(A_path)
+trainB = load_dataset(B_path)
+
+def downsample(filters, size, apply_batchnorm=True):
+    initializer = tf.random_normal_initializer(0., 0.02)
+
+    result = tf.keras.Sequential()
+    result.add(tf.keras.layers.Conv2D(filters, size, strides=2, padding='same',
+                                       kernel_initializer=initializer, use_bias=False))
+
+    if apply_batchnorm:
+        result.add(tf.keras.layers.BatchNormalization())
+
+    result.add(tf.keras.layers.LeakyReLU())
+    return result
+
+
+def upsample(filters, size, apply_dropout=False):
+    initializer = tf.random_normal_initializer(0., 0.02)
+
+    result = tf.keras.Sequential()
+    result.add(tf.keras.layers.Conv2DTranspose(filters, size, strides=2,
+                                               padding='same',
+                                               kernel_initializer=initializer,
+                                               use_bias=False))
+
+    result.add(tf.keras.layers.BatchNormalization())
+
+    if apply_dropout:
+        result.add(tf.keras.layers.Dropout(0.5))
+
+    result.add(tf.keras.layers.ReLU())
+    return result
+
+def Generator():
+    inputs = tf.keras.layers.Input(shape=[128,128,3])
+
+    x = tf.keras.layers.Conv2D(32, 4, strides=2, padding='same')(inputs)
+    x = tf.keras.layers.LeakyReLU()(x)
+
+    x = tf.keras.layers.Conv2D(64, 4, strides=2, padding='same')(x)
+    x = tf.keras.layers.LeakyReLU()(x)
+
+    x = tf.keras.layers.Conv2DTranspose(64, 4, strides=2, padding='same')(x)
+    x = tf.keras.layers.ReLU()(x)
+
+    x = tf.keras.layers.Conv2DTranspose(32, 4, strides=2, padding='same')(x)
+    x = tf.keras.layers.ReLU()(x)
+
+    outputs = tf.keras.layers.Conv2D(3, 3, padding='same', activation='tanh')(x)
+
+    return tf.keras.Model(inputs, outputs)
+
+def Discriminator():
+
+    inputs = tf.keras.layers.Input(shape=[128,128,3])
+
+    x = tf.keras.layers.Conv2D(32,4,strides=2,padding='same')(inputs)
+    x = tf.keras.layers.LeakyReLU()(x)
+
+    x = tf.keras.layers.Conv2D(64,4,strides=2,padding='same')(x)
+    x = tf.keras.layers.LeakyReLU()(x)
+
+    outputs = tf.keras.layers.Conv2D(1,4,padding='same')(x)
+
+    return tf.keras.Model(inputs, outputs)
+
+generator_g = Generator()  # A -> B
+generator_f = Generator()  # B -> A
+
+discriminator_x = Discriminator()  # A
+discriminator_y = Discriminator()  # B
+
+loss_obj = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+def discriminator_loss(real, generated):
+    real_loss = loss_obj(tf.ones_like(real), real)
+    generated_loss = loss_obj(tf.zeros_like(generated), generated)
+    return real_loss + generated_loss
+
+
+def generator_loss(generated):
+    return loss_obj(tf.ones_like(generated), generated)
+
+
+def cycle_loss(real_image, cycled_image):
+    return LAMBDA * tf.reduce_mean(tf.abs(real_image - cycled_image))
+
+
+def identity_loss(real_image, same_image):
+    return LAMBDA * 0.5 * tf.reduce_mean(tf.abs(real_image - same_image))
+
+gen_g_optimizer = tf.keras.optimizers.Adam(5e-5, beta_1=0.5)
+gen_f_optimizer = tf.keras.optimizers.Adam(5e-5, beta_1=0.5)
+
+disc_x_optimizer = tf.keras.optimizers.Adam(5e-5, beta_1=0.5)
+disc_y_optimizer = tf.keras.optimizers.Adam(5e-5, beta_1=0.5)
+
+@tf.function
+def train_step(real_x, real_y):
+    with tf.GradientTape(persistent=True) as tape:
+
+        fake_y = generator_g(real_x, training=True)
+        cycled_x = generator_f(fake_y, training=True)
+
+        fake_x = generator_f(real_y, training=True)
+        cycled_y = generator_g(fake_x, training=True)
+
+        same_x = generator_f(real_x, training=True)
+        same_y = generator_g(real_y, training=True)
+
+        disc_real_x = discriminator_x(real_x, training=True)
+        disc_real_y = discriminator_y(real_y, training=True)
+
+        disc_fake_x = discriminator_x(fake_x, training=True)
+        disc_fake_y = discriminator_y(fake_y, training=True)
+
+        gen_g_loss = generator_loss(disc_fake_y)
+        gen_f_loss = generator_loss(disc_fake_x)
+
+        total_cycle_loss = cycle_loss(real_x, cycled_x) + cycle_loss(real_y, cycled_y)
+
+        total_gen_g_loss = gen_g_loss + total_cycle_loss + identity_loss(real_y, same_y)
+        total_gen_f_loss = gen_f_loss + total_cycle_loss + identity_loss(real_x, same_x)
+
+        disc_x_loss = discriminator_loss(disc_real_x, disc_fake_x)
+        disc_y_loss = discriminator_loss(disc_real_y, disc_fake_y)
+
+    grads_g = tape.gradient(total_gen_g_loss, generator_g.trainable_variables)
+    grads_f = tape.gradient(total_gen_f_loss, generator_f.trainable_variables)
+
+    grads_dx = tape.gradient(disc_x_loss, discriminator_x.trainable_variables)
+    grads_dy = tape.gradient(disc_y_loss, discriminator_y.trainable_variables)
+   
+    grads_g, _ = tf.clip_by_global_norm(grads_g, 1.0)
+    grads_f, _ = tf.clip_by_global_norm(grads_f, 1.0)
+    grads_dx, _ = tf.clip_by_global_norm(grads_dx, 1.0)
+    grads_dy, _ = tf.clip_by_global_norm(grads_dy, 1.0)
+
+
+    gen_g_optimizer.apply_gradients(zip(grads_g, generator_g.trainable_variables))
+    gen_f_optimizer.apply_gradients(zip(grads_f, generator_f.trainable_variables))
+
+    disc_x_optimizer.apply_gradients(zip(grads_dx, discriminator_x.trainable_variables))
+    disc_y_optimizer.apply_gradients(zip(grads_dy, discriminator_y.trainable_variables))
+
+for epoch in range(20):
+    start = time.time()
+
+    n = 0
+    for image_x, image_y in tf.data.Dataset.zip((trainA, trainB)):
+        train_step(image_x, image_y)
+        if n % 10 == 0:
+            print(f"Epoch {epoch}, Step {n}")
+        n += 1
+
+    print(f"Time for epoch {epoch} is {time.time()-start} sec")
+
+def generate_images(model, test_input):
+    prediction = model(test_input, training=False)
+
+    plt.figure(figsize=(12, 12))
+
+    display_list = [test_input[0], prediction[0]]
+    title = ['Input', 'Generated']
+
+    for i in range(2):
+        plt.subplot(1, 2, i+1)
+        plt.title(title[i])
+        plt.imshow(display_list[i] * 0.5 + 0.5)
+        plt.axis('off')
+
+    plt.show()
+
+for inp in trainA.take(1):
+    generate_images(generator_g, inp)
+
